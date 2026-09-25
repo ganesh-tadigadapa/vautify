@@ -1,0 +1,29 @@
+# Override: grow the cluster to five storage nodes so the self-healing
+# scenarios have spare capacity to repair into.
+#   docker compose -f docker-compose.yml -f docker-compose.selfheal.yml up --build -d
+services:
+  vault-node-4:
+    extends: { file: docker-compose.yml, service: vault-node-1 }
+    command: ["node", "--id", "node-4", "--listen", "0.0.0.0:9001", "--data", "/data", "--enable-chaos"]
+    volumes: !override ["node-4-data:/data"]
+
+  vault-node-5:
+    extends: { file: docker-compose.yml, service: vault-node-1 }
+    command: ["node", "--id", "node-5", "--listen", "0.0.0.0:9001", "--data", "/data", "--enable-chaos"]
+    volumes: !override ["node-5-data:/data"]
+
+  vault-api:
+    command:
+      - api
+      - --listen=0.0.0.0:8080
+      - --data=/data
+      - --replication-factor=3
+      - --enable-chaos
+      - --nodes=node-1=http://vault-node-1:9001,node-2=http://vault-node-2:9001,node-3=http://vault-node-3:9001,node-4=http://vault-node-4:9001,node-5=http://vault-node-5:9001
+    depends_on:
+      vault-node-4: { condition: service_healthy }
+      vault-node-5: { condition: service_healthy }
+
+volumes:
+  node-4-data:
+  node-5-data:
