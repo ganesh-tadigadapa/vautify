@@ -8,6 +8,8 @@ It uses only the Go standard library. The binary and Go module are called `vault
 
 There's no auth and no TLS. It's a learning project, not something to put real data in.
 
+**Live demo:** <https://vault-store-865.netlify.app>. It's a real 5-node cluster, so you can upload files and break nodes from the Failure Lab. (See [Running it online](#running-it-online) for how it's hosted.)
+
 ## The core ideas
 
 **Every read is checksummed.** Each object's SHA-256 and size are stored in metadata. On a read, the coordinator streams a replica, hashes it, and compares. If it doesn't match, that replica is rejected, the failure is recorded, and the next replica is tried. If no replica verifies, the client gets `503 no_verified_replica`. Corrupt bytes are never returned. Nodes also hash incoming bytes on write and refuse to commit them if they don't match what the coordinator sent.
@@ -50,7 +52,18 @@ curl localhost:8080/objects/photo.jpg/metadata
 ls ./data/node-*/objects/photo.jpg/      # the actual bytes, in three node directories
 ```
 
-The read response headers tell you which node served it and which replicas were rejected (`X-Vault-Served-By`, `X-Vault-Rejected-Replicas`). There's also a small dashboard at <http://localhost:8080/>.
+The read response headers tell you which node served it and which replicas were rejected (`X-Vault-Served-By`, `X-Vault-Rejected-Replicas`). There's also a dashboard at <http://localhost:8080/>. It's one static page (`internal/api/ui/index.html`) embedded in the binary that calls the same JSON endpoints as `curl`. A sidebar switches between views, and each view has its own URL hash so you can bookmark it:
+
+| View | Shows |
+|---|---|
+| `#overview` | node, object and data totals, live node states, cluster topology |
+| `#objects` | uploads, the object list and where each replica lives |
+| `#analytics` | storage analytics |
+| `#events` | the event log, with a plain explanation of each event |
+| `#lab` | Failure Lab: kill, corrupt, partition, add latency, scrub, heal |
+| `#healing` | the self-healing lifecycle and the repair engine |
+| `#quorum` | quorum and consistency checks |
+| `#about` | what it is and how it's built |
 
 `make cluster` turns on the chaos endpoints, so you can break things on purpose:
 
@@ -69,7 +82,13 @@ make docker-selfheal-up && make docker-selfheal-smoke   # 5 nodes, self-healing
 make docker-partition-up && make docker-partition-smoke # partition, quorum, healing
 ```
 
-The compose files are a demo setup with chaos endpoints turned on.
+The compose files are a demo setup with chaos endpoints turned on. The restart policies are set up so the cluster survives a reboot without undoing your experiments:
+
+- `vault-api` uses `unless-stopped`, so it comes back after a crash, a reboot or a Docker restart.
+- Nodes use `on-failure` with `VAULT_EXIT_NONZERO_ON_SIGNAL=true`. A node you killed from the Failure Lab exits 0 and stays down, even across a reboot (`docker compose start vault-node-N` brings it back). A real crash gets restarted. When Docker shuts down, nodes exit 143, so they start again with the daemon.
+- Logs are rotated (5 × 20 MB per container), because the scrubber is chatty.
+
+Background loops (repair workers, scrubber, self-heal controller, health probes) recover from panics: they log the stack trace and keep running. A repair that panics counts as a failed attempt.
 
 ## Architecture
 
@@ -138,6 +157,25 @@ go test -count=1 ./test/integration  # builds the binary and launches real proce
 The integration tests are the part I spent the most time on. They start actual node and API processes on localhost and check things like: a corrupted replica on a live node is never served, killing a node triggers repair back to full replication with the files verified on disk, a CRITICAL object is repaired before a DEGRADED one, a node that missed a delete can't resurrect the object even across restarts, a coordinator crash mid-repair commits nothing, and concurrent compare-and-swap clients never lose an update.
 
 CI builds, vets and runs the full suite on every push to main and on pull requests.
+
+## Running it online
+
+The live demo runs on my own machine. I don't have a cloud VM for it:
+
+```
+browser -> Netlify (dashboard + proxy) -> Cloudflare quick tunnel -> docker compose (5 nodes + API)
+```
+
+Netlify serves the dashboard and proxies every API path to a `cloudflared` quick tunnel (`scripts/deploy-netlify.sh`). The catch is that a quick tunnel gets a new random URL every time it restarts, so after any reboot or Wi-Fi drop the site pointed at a dead address. `scripts/vaultctl.sh` fixes that. `vaultctl install` sets up launchd jobs that keep the tunnel running and check the public `/health` every two minutes. If something's broken, it starts Docker (and force-restarts it if it's frozen), starts the containers, gets a working tunnel and redeploys Netlify with the new URL. In testing, a killed tunnel was back in about a minute and a killed Docker in about 75 seconds.
+
+```sh
+vaultctl status    # Docker / API / tunnel / public site, each OK or DOWN
+vaultctl fix       # repair whatever is broken
+vaultctl publish   # deploy dashboard changes
+vaultctl rebuild   # rebuild the backend containers
+```
+
+It still needs the machine to be on and online. `scripts/deploy-gce.sh` is there for moving the backend to a VM.
 
 ## Known limits
 

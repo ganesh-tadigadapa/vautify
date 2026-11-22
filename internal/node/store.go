@@ -221,6 +221,14 @@ func (s *Store) Put(objectID string, version uint64, want integrity.Digest, r io
 	rec := replicaRecord{ObjectID: objectID, Version: version, SHA256: got.SHA256, Size: got.Size, StoredAt: time.Now().UTC()}
 	b, _ := json.Marshal(rec)
 	if err := writeFileAtomic(filepath.Join(s.root, tmpDir), metaPath, b); err != nil {
+		// Typically ENOSPC. A brand-new replica must not be left as a data
+		// file with no record: it would be counted on disk but fail every
+		// read/verify with a 500 instead of reading as absent. Remove it so
+		// the write is cleanly not committed. (An in-place rewrite of the
+		// same version keeps its previous, still-matching record.)
+		if replacedSize < 0 {
+			os.Remove(dataPath)
+		}
 		return storage.ReplicaInfo{}, fmt.Errorf("write replica record: %w", err)
 	}
 	if err := syncDir(dir); err != nil {

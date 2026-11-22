@@ -7,8 +7,10 @@ package events
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"runtime/debug"
 )
 
 // Name is a structured event name.
@@ -137,4 +139,21 @@ func (lg *Logger) Error(ctx context.Context, msg string, attrs ...any) {
 // Info logs a non-event operational message.
 func (lg *Logger) Info(ctx context.Context, msg string, attrs ...any) {
 	lg.l.Log(ctx, slog.LevelInfo, msg, attrs...)
+}
+
+// Recover stops a panic from unwinding further and logs it with its stack.
+// It must be deferred directly (defer lg.Recover(ctx, "where")) at the top
+// of a long-lived background goroutine or loop iteration, so that one bad
+// iteration is logged instead of terminating the whole process. It reports
+// whether a panic was recovered via the optional recovered pointer.
+func (lg *Logger) Recover(ctx context.Context, where string, recovered *bool) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	if recovered != nil {
+		*recovered = true
+	}
+	lg.l.Log(ctx, slog.LevelError, "recovered panic", "where", where,
+		"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 }

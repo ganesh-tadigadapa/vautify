@@ -3,6 +3,7 @@ package repair
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -289,8 +290,43 @@ func (m *Manager) runTask(ctx context.Context, worker int, t Task) {
 		"priority", string(t.Priority), "reason", t.Reason, "attempt", t.Attempts, "worker", worker,
 		"healthy_replicas", t.HealthyReplicas, "replication_factor", t.ReplicationFactor)
 	start := time.Now()
-	res, err := m.exec.Repair(ctx, t)
+	res, err := m.repairOnce(ctx, t)
 	m.finish(ctx, t, res, err, time.Since(start))
+}
+
+// repairOnce runs one attempt. A panic in the executor is turned into a
+// failed attempt (retried and eventually parked like any other failure)
+// instead of killing the worker, and with it the whole API process.
+func (m *Manager) repairOnce(ctx context.Context, t Task) (res Result, err error) {
+	var panicked bool
+	defer func() {
+		if panicked {
+			err = fmt.Errorf("%w: object %s", errRepairPanicked, t.ObjectID)
+		}
+	}()
+	defer m.log.Recover(ctx, "repair worker", &panicked)
+	return m.exec.Repair(ctx, t)
+}
+
+var errRepairPanicked = errors.New("repair attempt panicked (see log)")
+
+// Forget drops parked failures and restored-marks for objects that no
+// longer exist (live reports false), so these maps are bounded by the live
+// object count rather than growing with every object ever deleted. Queued
+// and active tasks are left alone: they resolve as superseded when run.
+func (m *Manager) Forget(live func(objectID string) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id := range m.failed {
+		if !live(id) {
+			delete(m.failed, id)
+		}
+	}
+	for id := range m.restored {
+		if !live(id) {
+			delete(m.restored, id)
+		}
+	}
 }
 
 func (m *Manager) finish(ctx context.Context, t Task, res Result, err error, took time.Duration) {

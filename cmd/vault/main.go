@@ -28,6 +28,9 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Remember which signal (if any) asked us to stop; see exitAfterSignal.
+	sigSeen := make(chan os.Signal, 1)
+	signal.Notify(sigSeen, os.Interrupt, syscall.SIGTERM)
 
 	var err error
 	args := os.Args[2:]
@@ -50,5 +53,26 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "vault:", err)
 		os.Exit(1)
+	}
+	exitAfterSignal(sigSeen)
+}
+
+// exitAfterSignal: with VAULT_EXIT_NONZERO_ON_SIGNAL=true, a clean shutdown
+// caused by SIGTERM/SIGINT exits with the conventional 128+signal status
+// instead of 0. Docker's on-failure restart policy restarts a container on
+// daemon start (Mac reboot, Docker Desktop restart) only if it last exited
+// non-zero, while a chaos-killed node still exits 0 and stays down. Off by
+// default, so local clusters, tests and demos keep exiting 0.
+func exitAfterSignal(sigSeen <-chan os.Signal) {
+	if os.Getenv("VAULT_EXIT_NONZERO_ON_SIGNAL") != "true" {
+		return
+	}
+	select {
+	case sig := <-sigSeen:
+		if s, ok := sig.(syscall.Signal); ok {
+			os.Exit(128 + int(s))
+		}
+		os.Exit(1)
+	default:
 	}
 }

@@ -141,9 +141,7 @@ func (c *Controller) Run(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					if _, err := c.Scrub(ctx); err != nil && ctx.Err() == nil {
-						c.log.Error(ctx, "background scrub failed", "error", err.Error())
-					}
+					c.scrubLogged(ctx)
 				}
 			}
 		}()
@@ -158,12 +156,27 @@ func (c *Controller) Run(ctx context.Context) {
 		case <-c.kick:
 		case <-t.C:
 		}
-		c.handleNodeChanges(ctx)
-		c.sweepLogged(ctx)
+		c.iterate(ctx)
+	}
+}
+
+// iterate is one pass of the controller loop. A panic is logged and the
+// loop carries on at the next tick rather than taking the process down.
+func (c *Controller) iterate(ctx context.Context) {
+	defer c.log.Recover(ctx, "self-heal controller", nil)
+	c.handleNodeChanges(ctx)
+	c.sweepLogged(ctx)
+}
+
+func (c *Controller) scrubLogged(ctx context.Context) {
+	defer c.log.Recover(ctx, "background scrub", nil)
+	if _, err := c.Scrub(ctx); err != nil && ctx.Err() == nil {
+		c.log.Error(ctx, "background scrub failed", "error", err.Error())
 	}
 }
 
 func (c *Controller) sweepLogged(ctx context.Context) {
+	defer c.log.Recover(ctx, "durability sweep", nil)
 	if _, err := c.Sweep(ctx); err != nil && ctx.Err() == nil {
 		c.log.Error(ctx, "durability sweep failed", "error", err.Error())
 	}
@@ -286,8 +299,17 @@ func (c *Controller) Sweep(ctx context.Context) (SweepReport, error) {
 			delete(c.belowSince, id)
 		}
 	}
+	// belowSince can also be set by RequestRepair without a lastState
+	// entry; prune it independently so deleted objects never linger.
+	for id := range c.belowSince {
+		if !seen[id] {
+			delete(c.belowSince, id)
+		}
+	}
 	c.lastSweep = &rep
 	c.mu.Unlock()
+	// Deleted objects' parked failures and restored-marks are dropped.
+	c.repairs.Forget(func(id string) bool { return seen[id] })
 	return rep, nil
 }
 
@@ -315,9 +337,14 @@ func (c *Controller) Scrub(ctx context.Context) (coordinator.ScrubReport, error)
 	c.mu.Lock()
 	c.scrubRunning = true
 	c.mu.Unlock()
+	defer func() {
+		// Also on a panic, so Status never reports a scrub stuck running.
+		c.mu.Lock()
+		c.scrubRunning = false
+		c.mu.Unlock()
+	}()
 	rep, err := c.coord.Scrub(ctx, c.cfg.ScrubConcurrency)
 	c.mu.Lock()
-	c.scrubRunning = false
 	c.lastScrub = &rep
 	c.mu.Unlock()
 	if err != nil {

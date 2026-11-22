@@ -13,7 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"vault/internal/cluster"
 	"vault/internal/coordinator"
+	"vault/internal/events"
 	"vault/internal/storage"
 )
 
@@ -164,5 +166,99 @@ func TestFailedCASWritesNoReplicasAndKeepsMetadata(t *testing.T) {
 	e.mustStatus(e.do(http.MethodPut, "/objects/doc?expected_version=2", randomBytes(64<<10, 6)), http.StatusOK, "correct CAS")
 	if len(diffDiskState(before, diskState(t, roots...))) == 0 {
 		t.Fatal("a successful CAS write left disk state unchanged; the snapshot sees nothing")
+	}
+}
+
+// replicaWriteLines counts the log lines of process p that record a replica
+// write to object id: a completed write (CHECKSUM_VERIFIED at stage
+// replica_write), a rejected one (CHECKSUM_MISMATCH at that stage), or one
+// that failed or was cut off mid-stream.
+func (e *env) replicaWriteLines(p *cluster.Process, id string) int {
+	e.t.Helper()
+	b, err := os.ReadFile(p.LogPath)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	n := 0
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		var m map[string]any
+		if json.Unmarshal(line, &m) != nil || m["object_id"] != id {
+			continue
+		}
+		if m["stage"] == "replica_write" || m["msg"] == "replica write failed" || m["msg"] == "replica stream interrupted" {
+			n++
+		}
+	}
+	return n
+}
+
+// A failed CAS must make zero replica writes. This is asserted directly,
+// not inferred from the coordinator's control flow: the coordinator must
+// not attempt a single OBJECT_REPLICA_WRITE, no node may log a replica write
+// of any outcome, and the object's metadata file must be byte-for-byte
+// identical afterwards.
+func TestFailedCASMakesZeroReplicaWrites(t *testing.T) {
+	e := startCluster(t, 3, 3)
+	e.put("doc", randomBytes(32<<10, 1))
+
+	metaFile := filepath.Join(e.c.API.DataDir, "metadata", "doc.json")
+	metaBefore, err := os.ReadFile(metaFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := func() (coord int, nodes map[string]int) {
+		nodes = map[string]int{}
+		for _, n := range e.c.Nodes {
+			nodes[n.Name] = e.replicaWriteLines(n, "doc")
+		}
+		return len(e.logEvents(e.c.API, string(events.ObjectReplicaWrite))), nodes
+	}
+	coordBefore, nodesBefore := counts()
+	if coordBefore != 3 {
+		t.Fatalf("setup: %d OBJECT_REPLICA_WRITE events for the first put, want 3", coordBefore)
+	}
+	total := 0
+	for _, n := range nodesBefore {
+		total += n
+	}
+	if total != 3 {
+		t.Fatalf("setup: nodes logged %d replica writes for the first put, want 3: %v", total, nodesBefore)
+	}
+
+	for _, expected := range []string{"0", "2", "9"} {
+		r := e.do(http.MethodPut, "/objects/doc?expected_version="+expected, randomBytes(32<<10, 2))
+		e.mustStatus(r, http.StatusConflict, "PUT with expected_version="+expected)
+
+		coord, nodes := counts()
+		if coord != coordBefore {
+			t.Fatalf("expected_version=%s: coordinator attempted %d replica writes, want 0", expected, coord-coordBefore)
+		}
+		for name, n := range nodes {
+			if n != nodesBefore[name] {
+				t.Fatalf("expected_version=%s: %s logged %d replica writes, want 0", expected, name, n-nodesBefore[name])
+			}
+		}
+		metaAfter, err := os.ReadFile(metaFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(metaAfter, metaBefore) {
+			t.Fatalf("expected_version=%s changed %s:\nbefore %s\nafter  %s", expected, metaFile, metaBefore, metaAfter)
+		}
+	}
+
+	// Control: the right expected_version writes, and the same counters see
+	// it, so the zero-write checks above are not vacuous.
+	e.mustStatus(e.do(http.MethodPut, "/objects/doc?expected_version=1", randomBytes(32<<10, 3)), http.StatusOK, "correct CAS")
+	coord, nodes := counts()
+	total = 0
+	for name, n := range nodes {
+		total += n - nodesBefore[name]
+	}
+	if coord-coordBefore != 3 || total != 3 {
+		t.Fatalf("correct CAS: coordinator %d, nodes %d replica writes, want 3 and 3", coord-coordBefore, total)
+	}
+	if metaAfter, _ := os.ReadFile(metaFile); bytes.Equal(metaAfter, metaBefore) {
+		t.Fatal("correct CAS left doc.json unchanged; the byte comparison sees nothing")
 	}
 }

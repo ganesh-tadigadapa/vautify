@@ -94,7 +94,7 @@ func (c *Coordinator) Scrub(ctx context.Context, concurrency int) (ScrubReport, 
 		go func() {
 			defer wg.Done()
 			for t := range tasks {
-				f, cleared := c.scrubReplica(ctx, t.obj, t.nodeID)
+				f, cleared := c.scrubReplicaSafe(ctx, t.obj, t.nodeID)
 				mu.Lock()
 				rep.ReplicasChecked++
 				switch f.Outcome {
@@ -143,6 +143,22 @@ feed:
 		"skipped_unavailable", rep.SkippedUnavailable, "errors", rep.Errors, "stale", rep.Stale,
 		"stale_versions_purged", rep.StaleVersionsPurged, "duration_ms", rep.DurationMS)
 	return rep, ctx.Err()
+}
+
+// scrubReplicaSafe is scrubReplica with a panic turned into an error
+// finding: a scrub worker is its own goroutine, so an unrecovered panic
+// there would terminate the API process.
+func (c *Coordinator) scrubReplicaSafe(ctx context.Context, obj metadata.Object, nodeID string) (f ScrubFinding, cleared bool) {
+	var panicked bool
+	defer func() {
+		if panicked {
+			f = ScrubFinding{ObjectID: obj.ID, Version: obj.Version, NodeID: nodeID,
+				Outcome: ScrubErrorResult, Error: "scrub of this replica panicked (see log)"}
+			cleared = false
+		}
+	}()
+	defer c.log.Recover(ctx, "scrub worker", &panicked)
+	return c.scrubReplica(ctx, obj, nodeID)
 }
 
 func (c *Coordinator) scrubReplica(ctx context.Context, obj metadata.Object, nodeID string) (ScrubFinding, bool) {
@@ -283,20 +299,26 @@ func (c *Coordinator) purgeStaleVersions(ctx context.Context, rep *ScrubReport) 
 			// the object lock, against the record as it is now: a stale
 			// version is removed only while a verified copy of the current
 			// version exists elsewhere (data of a deleted object: always).
-			unlock := c.locks.Lock(r.ObjectID)
-			cur, err := c.meta.GetRecord(ctx, r.ObjectID)
-			if err == nil && r.Version < cur.Version {
-				dctx, cancel := context.WithTimeout(ctx, c.cfg.ReplicaTimeout)
-				var res RemovalResult
-				res, err = c.removeReplicaLocked(dctx, cur, nodeID, r.Version, "scrub_purge", proofs[r.ObjectID])
-				cancel()
-				if err == nil && len(res.VerifiedBy) > 0 {
-					// Reuse this pass's verification for the object's other
-					// stale copies; it only counts while the version is current.
-					proofs[r.ObjectID] = &removalProof{version: cur.Version, nodes: res.VerifiedBy}
+			err := func() error {
+				// Deferred so that a panic below can never leave the
+				// object's lock held (which would wedge every later write,
+				// delete and repair of it).
+				unlock := c.locks.Lock(r.ObjectID)
+				defer unlock()
+				cur, err := c.meta.GetRecord(ctx, r.ObjectID)
+				if err == nil && r.Version < cur.Version {
+					dctx, cancel := context.WithTimeout(ctx, c.cfg.ReplicaTimeout)
+					defer cancel()
+					var res RemovalResult
+					res, err = c.removeReplicaLocked(dctx, cur, nodeID, r.Version, "scrub_purge", proofs[r.ObjectID])
+					if err == nil && len(res.VerifiedBy) > 0 {
+						// Reuse this pass's verification for the object's other
+						// stale copies; it only counts while the version is current.
+						proofs[r.ObjectID] = &removalProof{version: cur.Version, nodes: res.VerifiedBy}
+					}
 				}
-			}
-			unlock()
+				return err
+			}()
 			if err != nil {
 				rep.StalePurgeFailed++
 				continue

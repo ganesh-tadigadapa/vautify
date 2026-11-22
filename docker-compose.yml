@@ -6,15 +6,38 @@
 # POST /chaos/kill-node exits with status 0 and stays down (restart policy
 # on-failure); a real crash (non-zero exit) is restarted. Bring a killed node
 # back with: docker compose start vault-node-N
+#
+# Coming back after a Mac reboot / Docker Desktop restart:
+#   - vault-api uses unless-stopped: it is started again on daemon start
+#     (and after any exit) unless you stopped it yourself.
+#   - Nodes keep on-failure so the chaos semantics above hold, but run with
+#     VAULT_EXIT_NONZERO_ON_SIGNAL=true: when the daemon shuts down it sends
+#     SIGTERM, the node drains and exits 143, and on-failure restarts any
+#     container whose last exit was non-zero when the daemon starts again.
+#     A chaos-killed node (exit 0) stays down across the reboot as well.
+#
+# Logs are rotated (json-file, 5 x 20 MB per container): the API logs one
+# JSON line per replica per scrub, so unrotated logs grow by GBs per day.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 x-node: &node
   build: .
   image: vault:local
   restart: on-failure
+  logging: *logging
+  environment:
+    VAULT_EXIT_NONZERO_ON_SIGNAL: "true"
   healthcheck:
     test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9001/health"]
-    interval: 2s
-    timeout: 2s
-    retries: 15
+    interval: 10s
+    timeout: 3s
+    retries: 3
+    start_period: 30s
+    start_interval: 1s
 
 services:
   vault-node-1:
@@ -35,7 +58,8 @@ services:
   vault-api:
     build: .
     image: vault:local
-    restart: on-failure
+    restart: unless-stopped
+    logging: *logging
     environment:
       VAULT_REPAIR_WORKERS: "4"
       VAULT_SCRUB_INTERVAL: "30s"
@@ -54,9 +78,11 @@ services:
       vault-node-3: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
 
 volumes:
   node-1-data:

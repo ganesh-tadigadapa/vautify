@@ -108,6 +108,10 @@ func (c *Checker) ProbeAll(ctx context.Context) {
 		wg.Add(1)
 		go func(n Prober) {
 			defer wg.Done()
+			// A probe runs in its own goroutine; a panic here must not
+			// take the coordinator down. (Deferred after wg.Done, so it
+			// runs first and Done still fires.)
+			defer c.log.Recover(ctx, "health probe "+n.ID(), nil)
 			pctx, cancel := context.WithTimeout(ctx, c.timeout)
 			defer cancel()
 			h, err := n.Health(pctx)
@@ -156,7 +160,11 @@ func (c *Checker) markUnavailable(ctx context.Context, id, source string, err er
 
 func (c *Checker) markHealthy(ctx context.Context, id string, capacity storage.Capacity) {
 	c.mu.Lock()
-	st := c.status[id]
+	st, ok := c.status[id]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
 	now := time.Now().UTC()
 	recovered := st.State != storage.StateHealthy && !st.LastChecked.IsZero()
 	changed := st.State != storage.StateHealthy

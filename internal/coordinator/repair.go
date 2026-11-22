@@ -150,9 +150,11 @@ func (c *Coordinator) RepairObject(ctx context.Context, id string) (repair.Resul
 			return res, ctx.Err()
 		}
 	}
-	unlock := c.locks.Lock(id)
-	committed, replaced, staleFixed, err := c.commitRepair(ctx, obj, written)
-	unlock()
+	committed, replaced, staleFixed, err := func() (metadata.Object, []string, []staleFix, error) {
+		unlock := c.locks.Lock(id)
+		defer unlock() // deferred: a panic must never leave the object locked
+		return c.commitRepair(ctx, obj, written)
+	}()
 	if err != nil {
 		cleanup := written
 		if !errors.Is(err, repair.ErrSuperseded) {
@@ -197,22 +199,24 @@ func (c *Coordinator) RepairObject(ctx context.Context, id string) (repair.Resul
 	if len(garbage) > 0 || len(staleGarbage) > 0 {
 		proof := &removalProof{version: obj.Version, nodes: written}
 		var removed, left []string
-		unlock := c.locks.Lock(id)
-		if rec, err := c.meta.GetRecord(ctx, id); err == nil {
-			for _, n := range garbage {
-				if _, err := c.removeReplicaLocked(ctx, rec, n, obj.Version, "replaced_by_repair", proof); err != nil {
-					left = append(left, n)
-				} else {
-					removed = append(removed, n)
+		func() {
+			unlock := c.locks.Lock(id)
+			defer unlock() // deferred: a panic must never leave the object locked
+			if rec, err := c.meta.GetRecord(ctx, id); err == nil {
+				for _, n := range garbage {
+					if _, err := c.removeReplicaLocked(ctx, rec, n, obj.Version, "replaced_by_repair", proof); err != nil {
+						left = append(left, n)
+					} else {
+						removed = append(removed, n)
+					}
 				}
+				for _, sf := range staleGarbage {
+					c.removeReplicaLocked(ctx, rec, sf.node, sf.observed, "stale_replaced_by_repair", proof)
+				}
+			} else {
+				left = garbage
 			}
-			for _, sf := range staleGarbage {
-				c.removeReplicaLocked(ctx, rec, sf.node, sf.observed, "stale_replaced_by_repair", proof)
-			}
-		} else {
-			left = garbage
-		}
-		unlock()
+		}()
 		if len(garbage) > 0 {
 			c.log.Emit(ctx, events.ReplicaCleanup, "object_id", id, "version", obj.Version,
 				"reason", "replaced_by_repair", "removed_from", removed, "retained_on", left)
