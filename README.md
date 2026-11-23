@@ -1,5 +1,11 @@
 # Vautify
 
+[![CI](https://github.com/ganesh-tadigadapa/vautify/actions/workflows/ci.yml/badge.svg)](https://github.com/ganesh-tadigadapa/vautify/actions/workflows/ci.yml)
+[![Live demo](https://img.shields.io/badge/live%20demo-vault--store--865.netlify.app-2ea44f)](https://vault-store-865.netlify.app)
+![Go](https://img.shields.io/badge/go-1.23%2B-00ADD8)
+
+**▶ Live demo: <https://vault-store-865.netlify.app>**
+
 A distributed object store in Go that keeps several copies of every file, checks every byte on read, and repairs itself when nodes crash, corrupt data or drop off the network.
 
 I wanted to understand what actually goes into storage systems like S3 beyond "keep three copies". Replication is the easy part. The interesting problems are the ones where a node is up and answering but its data is wrong, or comes back after an outage holding old bytes, or a write half-lands during a network cut. So I built this to work through those cases one at a time, with real processes and real files on disk, and tests that kill and corrupt things on purpose.
@@ -8,7 +14,17 @@ It uses only the Go standard library. The binary and Go module are called `vault
 
 There's no auth and no TLS. It's a learning project, not something to put real data in.
 
-**Live demo:** <https://vault-store-865.netlify.app>. It's a real 5-node cluster, so you can upload files and break nodes from the Failure Lab. (See [Running it online](#running-it-online) for how it's hosted.)
+## Try the live demo
+
+<https://vault-store-865.netlify.app> is a real 5-node cluster (replication factor 3, write quorum `all`, read quorum `1`, self-healing on), not a mock-up. Everything you do there happens to real processes and real files on disk. A two-minute tour:
+
+1. **Overview**: see all five nodes, the object count and the cluster topology.
+2. **Objects**: upload a file and see which three nodes got a copy.
+3. **Failure Lab**: kill a node or corrupt one replica of your file.
+4. **Self-Healing**: watch the object go DEGRADED and get repaired back to three verified copies.
+5. **Events**: read what happened, step by step, in plain language.
+
+It's a shared playground, so other people may be breaking nodes at the same time. If the site is down, my machine is probably off (see [Running it online](#running-it-online)).
 
 ## The core ideas
 

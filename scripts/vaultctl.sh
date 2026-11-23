@@ -68,7 +68,15 @@ tmo() {
 }
 
 # ---------- probes ----------
-online()       { curl -fsS -m 6 -o /dev/null https://1.1.1.1 2>/dev/null; }
+# Any HTTP answer from any of these counts; some networks block 1.1.1.1 or
+# dns.google outright, and one blocked host must not look like "offline".
+online() {
+  local u
+  for u in https://www.cloudflare.com https://api.netlify.com https://1.1.1.1; do
+    [ "$(curl -sS -m 6 -o /dev/null -w '%{http_code}' "$u" 2>/dev/null)" != "000" ] && return 0
+  done
+  return 1
+}
 docker_up()    { tmo 15 docker info >/dev/null 2>&1; }
 local_ok()     { curl -fsS -m 4 "http://localhost:$PORT/health" 2>/dev/null | grep -q '"status": *"ok"'; }
 public_ok()    { curl -fsS -m 15 "https://$SITE_NAME.netlify.app/health" 2>/dev/null | grep -q '"status": *"ok"'; }
@@ -76,11 +84,26 @@ tunnel_url()   { grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG"
 
 # Reach the tunnel through public DNS (1.1.1.1): the Mac's own resolver often
 # caches "no such host" for a brand-new trycloudflare name for minutes.
+# Some networks (office/campus Wi-Fi) block plain DNS to outside resolvers, so
+# try, in order: the system resolver, DNS-over-HTTPS (port 443), then dig with
+# a short timeout. Relying on dig @1.1.1.1 alone made every tunnel look dead.
+resolve_ip() {
+  local host=$1 ip
+  ip=$(curl -fsS -m 5 -H 'accept: application/dns-json' \
+        "https://1.1.1.1/dns-query?name=$host&type=A" 2>/dev/null \
+        | grep -oE '"data":"[0-9.]+"' | head -1 | grep -oE '[0-9.]+')
+  [ -n "$ip" ] || ip=$(curl -fsS -m 5 "https://dns.google/resolve?name=$host&type=A" 2>/dev/null \
+        | grep -oE '"data": *"[0-9.]+"' | head -1 | grep -oE '[0-9]+\.[0-9.]+')
+  [ -n "$ip" ] || ip=$(dig +short +time=2 +tries=1 @1.1.1.1 "$host" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+  echo "$ip"
+}
+
 tunnel_ok() {
   local url=$1 host ip
   [ -n "$url" ] || return 1
   host=${url#https://}
-  ip=$(dig +short @1.1.1.1 "$host" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+  curl -fsS -m 10 "$url/health" 2>/dev/null | grep -q '"status": *"ok"' && return 0
+  ip=$(resolve_ip "$host")
   [ -n "$ip" ] || return 1
   curl -fsS -m 10 --resolve "$host:443:$ip" "$url/health" 2>/dev/null | grep -q '"status": *"ok"'
 }
@@ -176,13 +199,20 @@ H
   log "Deploying $SITE_NAME -> $url"
   # Run from the site folder with --no-build: launchd starts jobs in "/",
   # where netlify-cli would try (and fail) to run a build.
-  if (cd "$SITE_DIR" && npx --yes netlify-cli deploy --prod --no-build --dir . \
-       --site "$SITE_ID" --message "vaultctl: tunnel $url") >>"$LOG" 2>&1; then
-    echo "$url" > "$STATE_URL"
-    log "Deployed"
-  else
-    log "ERROR: Netlify deploy failed (logged out? run: npx netlify-cli login)"; return 1
-  fi
+  # On a flaky network the Netlify API sometimes answers "Project not found";
+  # a retry a few seconds later goes through, so try a few times.
+  local try
+  for try in 1 2 3 4; do
+    if (cd "$SITE_DIR" && npx --yes netlify-cli deploy --prod --no-build --dir . \
+         --site "$SITE_ID" --message "vaultctl: tunnel $url") >>"$LOG" 2>&1; then
+      echo "$url" > "$STATE_URL"
+      log "Deployed"
+      return 0
+    fi
+    log "Netlify deploy attempt $try failed; retrying"
+    sleep $((try * 10))
+  done
+  log "ERROR: Netlify deploy failed (logged out? run: npx netlify-cli login)"; return 1
 }
 
 heal() {
